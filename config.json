@@ -1,0 +1,26 @@
+{
+  "request": {
+    "url_template": "https://shsd.buaa.edu.cn/PubBuaa?id={meter_id}",
+    "timeout_seconds": 20,
+    "retries": 2,
+    "max_stale_hours": 36
+  },
+  "meters": [
+    {
+      "key": "air_conditioner",
+      "name": "空调电表",
+      "meter_id": "44229",
+      "expected_address_contains": "[空调]",
+      "warning_threshold_kwh": 10,
+      "critical_threshold_kwh": 5
+    },
+    {
+      "key": "lighting",
+      "name": "照明电表",
+      "meter_id": "44588",
+      "expected_address_contains": "[照明]",
+      "warning_threshold_kwh": 30,
+      "critical_threshold_kwh": 15
+    }
+  ]
+}

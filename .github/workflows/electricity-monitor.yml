@@ -1,0 +1,61 @@
+name: Dorm electricity monitor
+
+on:
+  schedule:
+    # The university page currently exposes data updated at 00:00 each day.
+    # Run at 08:17 China time and avoid the busy start of the hour.
+    - cron: "17 8 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+    inputs:
+      send_test_notification:
+        description: "Send a Telegram test message before checking meters"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dorm-electricity-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate Telegram secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+            echo "::error::Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in repository Actions secrets."
+            exit 1
+          fi
+
+      - name: Query both meters
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEND_TEST_NOTIFICATION: ${{ inputs.send_test_notification }}
+        run: |
+          args=(--config config.json --output monitor-result.json)
+          if [[ "$SEND_TEST_NOTIFICATION" == "true" ]]; then
+            args+=(--test-notification)
+          fi
+          python monitor.py "${args[@]}"
