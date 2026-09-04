@@ -1,8 +1,20 @@
+import json
+import os
 import unittest
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from monitor import MonitorError, build_alert, parse_meter_page
+from monitor import (
+    MonitorError,
+    build_daily_report,
+    generate_chart,
+    parse_meter_page,
+    telegram_send_photo,
+    update_history,
+)
 
 
 PAGE = """
@@ -31,8 +43,7 @@ def meter(kind="[照明]", meter_id="44588"):
         "name": "照明电表",
         "meter_id": meter_id,
         "expected_address_contains": kind,
-        "warning_threshold_kwh": 30,
-        "critical_threshold_kwh": 15,
+        "alert_threshold_cny": 10,
     }
 
 
@@ -49,28 +60,27 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual(reading.meter_id, "44588")
         self.assertEqual(reading.remaining_kwh, 91)
+        self.assertEqual(reading.remaining_cny, 43.68)
         self.assertIsNone(reading.yesterday_kwh)
         self.assertEqual(reading.price_cny_per_kwh, 0.48)
         self.assertEqual(reading.level, "ok")
         self.assertEqual(reading.recent_purchases[0]["quantity_kwh"], "100")
 
-    def test_critical_level_is_independent_per_meter(self):
+    def test_money_alert_level_is_independent_per_meter(self):
         reading = parse_meter_page(
             PAGE.format(meter_id="44229", kind="[空调]", remaining="0"),
             {
                 **meter(kind="[空调]", meter_id="44229"),
                 "key": "air_conditioner",
                 "name": "空调电表",
-                "warning_threshold_kwh": 10,
-                "critical_threshold_kwh": 5,
             },
             max_stale_hours=36,
             now=NOW,
         )
-        self.assertEqual(reading.level, "critical")
-        alert = build_alert([reading], [])
-        self.assertIn("空调电表", alert)
-        self.assertIn("剩余 0 kWh", alert)
+        self.assertEqual(reading.level, "alert")
+        report = build_daily_report([reading], [])
+        self.assertIn("空调电表", report)
+        self.assertIn("剩余 0 kWh ≈ ¥0", report)
 
     def test_rejects_wrong_meter_address(self):
         with self.assertRaisesRegex(MonitorError, "地址校验失败"):
@@ -89,6 +99,62 @@ class ParserTests(unittest.TestCase):
                 max_stale_hours=3,
                 now=NOW,
             )
+
+    def test_history_upsert_and_chart(self):
+        lighting = parse_meter_page(
+            PAGE.format(meter_id="44588", kind="[照明]", remaining="91"),
+            meter(),
+            max_stale_hours=36,
+            now=NOW,
+        )
+        air_conditioner = parse_meter_page(
+            PAGE.format(meter_id="44229", kind="[空调]", remaining="0"),
+            {
+                **meter(kind="[空调]", meter_id="44229"),
+                "key": "air_conditioner",
+                "name": "空调电表",
+            },
+            max_stale_hours=36,
+            now=NOW,
+        )
+        report = build_daily_report([air_conditioner, lighting], [])
+        self.assertIn("空调电表", report)
+        self.assertIn("照明电表", report)
+
+        with TemporaryDirectory() as directory:
+            history_path = Path(directory) / "history.csv"
+            chart_path = Path(directory) / "chart.png"
+            rows = update_history(history_path, [air_conditioner, lighting])
+            rows = update_history(history_path, [air_conditioner, lighting])
+            self.assertEqual(len(rows), 2)
+            generate_chart(rows, [air_conditioner, lighting], chart_path)
+            self.assertGreater(chart_path.stat().st_size, 1_000)
+
+    def test_telegram_photo_uses_multipart_without_exposing_secrets(self):
+        response = MagicMock()
+        response.read.return_value = json.dumps({"ok": True}).encode()
+        context = MagicMock()
+        context.__enter__.return_value = response
+        context.__exit__.return_value = False
+
+        with TemporaryDirectory() as directory:
+            chart_path = Path(directory) / "chart.png"
+            chart_path.write_bytes(b"fake-png-data")
+            with patch.dict(
+                os.environ,
+                {
+                    "TELEGRAM_BOT_TOKEN": "123:test-token",
+                    "TELEGRAM_CHAT_ID": "456",
+                },
+                clear=False,
+            ), patch("monitor.urlopen", return_value=context) as mocked_urlopen:
+                telegram_send_photo(chart_path, "daily report")
+
+        request = mocked_urlopen.call_args.args[0]
+        self.assertIn(b'name="photo"', request.data)
+        self.assertIn(b"fake-png-data", request.data)
+        self.assertIn(b"daily report", request.data)
+        self.assertNotIn(b"test-token", request.data)
 
 
 if __name__ == "__main__":

@@ -10,13 +10,15 @@ alert.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -133,13 +135,13 @@ class Reading:
     address: str
     price_cny_per_kwh: float | None
     remaining_kwh: float
+    remaining_cny: float | None
     yesterday_kwh: float | None
     cutoff: str
     source_age_hours: float | None
     checked_at: str
     level: str
-    warning_threshold_kwh: float
-    critical_threshold_kwh: float
+    alert_threshold_cny: float
     recent_purchases: list[dict[str, str]]
 
 
@@ -195,14 +197,14 @@ def parse_meter_page(
         )
 
     remaining = parse_number(remaining_text, "剩余电量")
-    warning = float(meter["warning_threshold_kwh"])
-    critical = float(meter["critical_threshold_kwh"])
-    if remaining <= critical:
-        level = "critical"
-    elif remaining <= warning:
-        level = "warning"
-    else:
-        level = "ok"
+    price = parse_optional_number(price_text)
+    remaining_cny = round(remaining * price, 2) if price is not None else None
+    alert_threshold_cny = float(meter["alert_threshold_cny"])
+    level = (
+        "alert"
+        if remaining_cny is not None and remaining_cny <= alert_threshold_cny
+        else "ok"
+    )
 
     purchases: list[dict[str, str]] = []
     for row in parser.table_rows:
@@ -221,10 +223,9 @@ def parse_meter_page(
         name=str(meter["name"]),
         meter_id=str(meter["meter_id"]),
         address=address,
-        price_cny_per_kwh=(
-            parse_optional_number(price_text) if price_text is not None else None
-        ),
+        price_cny_per_kwh=price,
         remaining_kwh=remaining,
+        remaining_cny=remaining_cny,
         yesterday_kwh=parse_optional_number(parser.widgets.get("canvas2")),
         cutoff=cutoff,
         source_age_hours=(
@@ -232,8 +233,7 @@ def parse_meter_page(
         ),
         checked_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         level=level,
-        warning_threshold_kwh=warning,
-        critical_threshold_kwh=critical,
+        alert_threshold_cny=alert_threshold_cny,
         recent_purchases=purchases,
     )
 
@@ -273,8 +273,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "name",
         "meter_id",
         "expected_address_contains",
-        "warning_threshold_kwh",
-        "critical_threshold_kwh",
+        "alert_threshold_cny",
     }
     keys: set[str] = set()
     for meter in meters:
@@ -284,10 +283,8 @@ def load_config(path: Path) -> dict[str, Any]:
         if meter["key"] in keys:
             raise MonitorError(f"电表 key 重复：{meter['key']}")
         keys.add(str(meter["key"]))
-        if float(meter["critical_threshold_kwh"]) > float(
-            meter["warning_threshold_kwh"]
-        ):
-            raise MonitorError(f"{meter['name']} 的严重阈值不能高于预警阈值")
+        if float(meter["alert_threshold_cny"]) < 0:
+            raise MonitorError(f"{meter['name']} 的金额阈值不能小于 0")
     return config
 
 
@@ -316,13 +313,187 @@ def query_all(config: dict[str, Any]) -> tuple[list[Reading], list[str]]:
     return readings, errors
 
 
-def telegram_send(message: str) -> None:
+HISTORY_FIELDS = [
+    "date",
+    "checked_at",
+    "cutoff",
+    "key",
+    "name",
+    "meter_id",
+    "remaining_kwh",
+    "price_cny_per_kwh",
+    "remaining_cny",
+    "level",
+]
+
+
+def reading_date(reading: Reading) -> str:
+    try:
+        return datetime.strptime(
+            reading.cutoff.split()[0], "%Y/%m/%d"
+        ).date().isoformat()
+    except ValueError:
+        return datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+
+def read_history(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as history_file:
+            return list(csv.DictReader(history_file))
+    except OSError as exc:
+        raise MonitorError(f"无法读取历史文件 {path}：{exc}") from exc
+
+
+def update_history(path: Path, readings: list[Reading]) -> list[dict[str, str]]:
+    """Upsert one row per meter and source date, then return all rows."""
+    rows = read_history(path)
+    by_identity = {
+        (row.get("date", ""), row.get("key", "")): row
+        for row in rows
+        if row.get("date") and row.get("key")
+    }
+    for reading in readings:
+        row = {
+            "date": reading_date(reading),
+            "checked_at": reading.checked_at,
+            "cutoff": reading.cutoff,
+            "key": reading.key,
+            "name": reading.name,
+            "meter_id": reading.meter_id,
+            "remaining_kwh": format_number(reading.remaining_kwh),
+            "price_cny_per_kwh": format_number(reading.price_cny_per_kwh),
+            "remaining_cny": format_number(reading.remaining_cny),
+            "level": reading.level,
+        }
+        by_identity[(row["date"], row["key"])] = row
+
+    rows = sorted(
+        by_identity.values(), key=lambda row: (row["date"], row["key"])
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("w", newline="", encoding="utf-8") as history_file:
+            writer = csv.DictWriter(history_file, fieldnames=HISTORY_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as exc:
+        raise MonitorError(f"无法写入历史文件 {path}：{exc}") from exc
+    return rows
+
+
+def generate_chart(
+    rows: list[dict[str, str]],
+    readings: list[Reading],
+    output_path: Path,
+    *,
+    days: int = 30,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise MonitorError("生成折线图需要安装 requirements.txt 中的 matplotlib") from exc
+
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    earliest = today - timedelta(days=days - 1)
+    chart_names = {
+        "air_conditioner": "Air conditioner",
+        "lighting": "Lighting",
+    }
+    figure, axes = plt.subplots(
+        max(1, len(readings)), 1, figsize=(9, 3.3 * max(1, len(readings)))
+    )
+    if len(readings) == 1:
+        axes = [axes]
+
+    for axis, reading in zip(axes, readings):
+        points: list[tuple[date, float]] = []
+        for row in rows:
+            if row.get("key") != reading.key:
+                continue
+            try:
+                day = date.fromisoformat(row["date"])
+                value = float(row["remaining_kwh"])
+            except (KeyError, ValueError):
+                continue
+            if day >= earliest:
+                points.append((day, value))
+        points.sort(key=lambda point: point[0])
+
+        if points:
+            axis.plot(
+                [point[0] for point in points],
+                [point[1] for point in points],
+                color="#2563eb",
+                marker="o",
+                linewidth=2.2,
+                markersize=5,
+                label="Remaining",
+            )
+            latest_day, latest_value = points[-1]
+            axis.annotate(
+                f"{latest_value:g} kWh",
+                (latest_day, latest_value),
+                xytext=(6, 8),
+                textcoords="offset points",
+                fontsize=9,
+            )
+
+        if reading.price_cny_per_kwh:
+            threshold_kwh = (
+                reading.alert_threshold_cny / reading.price_cny_per_kwh
+            )
+            axis.axhline(
+                threshold_kwh,
+                color="#dc2626",
+                linestyle="--",
+                linewidth=1.6,
+                label=f"CNY {reading.alert_threshold_cny:g} alert line",
+            )
+
+        axis.set_title(chart_names.get(reading.key, reading.key))
+        axis.set_ylabel("Remaining (kWh)")
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="best", fontsize=8)
+        axis.set_xlim(earliest, today + timedelta(days=1))
+        axis.margins(y=0.15)
+        axis.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+
+    axes[-1].set_xlabel("Date (Asia/Shanghai)")
+    figure.suptitle(f"Dorm electricity - last {days} days", fontsize=14)
+    figure.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
+def telegram_credentials() -> tuple[str, str]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         raise MonitorError(
             "缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID；请配置 GitHub Actions Secrets"
         )
+    return token, chat_id
+
+
+def telegram_error(exc: HTTPError) -> MonitorError:
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+        details = json.loads(body).get("description", body)
+    except (OSError, json.JSONDecodeError):
+        details = str(exc)
+    return MonitorError(f"Telegram API HTTP {exc.code}：{details}")
+
+
+def telegram_send(message: str) -> None:
+    token, chat_id = telegram_credentials()
 
     endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = urlencode(
@@ -340,8 +511,56 @@ def telegram_send(message: str) -> None:
     try:
         with urlopen(request, timeout=20) as response:
             result = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except HTTPError as exc:
+        raise telegram_error(exc) from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise MonitorError(f"Telegram 消息发送失败：{exc}") from exc
+    if not result.get("ok"):
+        raise MonitorError(f"Telegram API 返回失败：{result.get('description', result)}")
+
+
+def telegram_send_photo(image_path: Path, caption: str) -> None:
+    token, chat_id = telegram_credentials()
+    boundary = f"----electricity-monitor-{uuid.uuid4().hex}"
+    body = bytearray()
+
+    def add_field(name: str, value: str) -> None:
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        )
+        body.extend(value.encode("utf-8"))
+        body.extend(b"\r\n")
+
+    add_field("chat_id", chat_id)
+    add_field("caption", caption)
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(
+        b'Content-Disposition: form-data; name="photo"; filename="electricity-history.png"\r\n'
+    )
+    body.extend(b"Content-Type: image/png\r\n\r\n")
+    try:
+        body.extend(image_path.read_bytes())
+    except OSError as exc:
+        raise MonitorError(f"无法读取折线图 {image_path}：{exc}") from exc
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+
+    request = Request(
+        f"https://api.telegram.org/bot{token}/sendPhoto",
+        data=bytes(body),
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise telegram_error(exc) from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise MonitorError(f"Telegram 图片发送失败：{exc}") from exc
     if not result.get("ok"):
         raise MonitorError(f"Telegram API 返回失败：{result.get('description', result)}")
 
@@ -352,45 +571,39 @@ def format_number(value: float | None) -> str:
     return f"{value:g}"
 
 
-def build_alert(readings: list[Reading], errors: list[str]) -> str | None:
-    abnormal = [reading for reading in readings if reading.level != "ok"]
-    if not abnormal and not errors:
-        return None
-
-    lines = ["⚡ 北航宿舍电量告警"]
-    for reading in abnormal:
-        icon = "🚨" if reading.level == "critical" else "⚠️"
-        threshold = (
-            reading.critical_threshold_kwh
-            if reading.level == "critical"
-            else reading.warning_threshold_kwh
-        )
+def build_daily_report(readings: list[Reading], errors: list[str]) -> str:
+    has_alert = any(reading.level == "alert" for reading in readings) or bool(errors)
+    lines = ["🚨 北航宿舍电量告警" if has_alert else "⚡ 北航宿舍电量日报"]
+    for reading in readings:
+        icon = "🚨" if reading.level == "alert" else "✅"
         lines.append(
             f"{icon} {reading.name}：剩余 {format_number(reading.remaining_kwh)} kWh"
-            f"（阈值 {format_number(threshold)} kWh）"
+            f" ≈ ¥{format_number(reading.remaining_cny)}"
         )
         lines.append(f"数据截止：{reading.cutoff}")
     for error in errors:
         lines.append(f"❌ 查询异常：{error}")
-    lines.append("请登录学校购电页面复核；网站数据可能与实际值存在偏差。")
+    lines.append("告警线：剩余价值 ≤ ¥10")
+    lines.append("学校数据仅供参考，低电量时请登录购电页面复核。")
     return "\n".join(lines)
 
 
 def build_markdown(readings: list[Reading], errors: list[str]) -> str:
-    labels = {"ok": "正常", "warning": "预警", "critical": "严重"}
+    labels = {"ok": "正常", "alert": "告警"}
     lines = [
         "# 宿舍电费监控结果",
         "",
-        "| 电表 | 表号 | 类型 | 剩余电量 | 昨日用电 | 数据截止 |",
-        "|---|---:|---|---:|---:|---|",
+        "| 电表 | 表号 | 状态 | 剩余电量 | 折算金额 | 昨日用电 | 数据截止 |",
+        "|---|---:|---|---:|---:|---:|---|",
     ]
     for reading in readings:
         lines.append(
-            "| {name} | {meter_id} | {level} | {remaining} kWh | {yesterday} | {cutoff} |".format(
+            "| {name} | {meter_id} | {level} | {remaining} kWh | ¥{money} | {yesterday} | {cutoff} |".format(
                 name=reading.name,
                 meter_id=reading.meter_id,
                 level=labels[reading.level],
                 remaining=format_number(reading.remaining_kwh),
+                money=format_number(reading.remaining_cny),
                 yesterday=(
                     f"{format_number(reading.yesterday_kwh)} kWh"
                     if reading.yesterday_kwh is not None
@@ -446,6 +659,18 @@ def main(argv: list[str] | None = None) -> int:
         help="机器可读结果的输出路径",
     )
     parser.add_argument(
+        "--history",
+        type=Path,
+        default=Path("data/history.csv"),
+        help="跨运行保存的历史 CSV",
+    )
+    parser.add_argument(
+        "--chart",
+        type=Path,
+        default=Path("electricity-history.png"),
+        help="发送到 Telegram 的折线图路径",
+    )
+    parser.add_argument(
         "--no-notify",
         action="store_true",
         help="只查询，不发送 Telegram 消息",
@@ -464,12 +689,19 @@ def main(argv: list[str] | None = None) -> int:
 
         readings, errors = query_all(config)
         write_outputs(args.output, readings, errors)
+        history_rows = update_history(args.history, readings)
 
-        alert = build_alert(readings, errors)
-        if alert and not args.no_notify:
-            telegram_send(alert)
-        elif not alert:
-            print("两个电表均高于各自预警阈值，无需发送告警。")
+        chart_created = False
+        if readings:
+            generate_chart(history_rows, readings, args.chart)
+            chart_created = True
+
+        report = build_daily_report(readings, errors)
+        if not args.no_notify:
+            if chart_created:
+                telegram_send_photo(args.chart, report)
+            else:
+                telegram_send(report)
 
         return 1 if errors else 0
     except MonitorError as exc:
