@@ -11,6 +11,9 @@ from monitor import (
     MonitorError,
     build_daily_report,
     generate_chart,
+    main,
+    mark_notification_sent,
+    notification_already_sent,
     parse_meter_page,
     telegram_send_photo,
     update_history,
@@ -129,6 +132,54 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             generate_chart(rows, [air_conditioner, lighting], chart_path)
             self.assertGreater(chart_path.stat().st_size, 1_000)
+
+    def test_notification_state_deduplicates_by_china_date(self):
+        first_run = datetime(
+            2026, 9, 5, 0, 17, tzinfo=ZoneInfo("UTC")
+        )
+        same_china_day = datetime(
+            2026, 9, 5, 1, 17, tzinfo=ZoneInfo("UTC")
+        )
+        next_china_day = datetime(
+            2026, 9, 6, 0, 17, tzinfo=ZoneInfo("UTC")
+        )
+
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "notification-state.json"
+            self.assertFalse(
+                notification_already_sent(state_path, now=first_run)
+            )
+            mark_notification_sent(state_path, now=first_run)
+            self.assertTrue(
+                notification_already_sent(state_path, now=same_china_day)
+            )
+            self.assertFalse(
+                notification_already_sent(state_path, now=next_china_day)
+            )
+
+    def test_scheduled_retry_skips_query_after_daily_success(self):
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            state_path = directory_path / "notification-state.json"
+            config_path = directory_path / "config.json"
+            config_path.write_text(
+                json.dumps({"meters": [meter()]}), encoding="utf-8"
+            )
+            mark_notification_sent(state_path)
+
+            with patch("monitor.query_all") as mocked_query:
+                result = main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "--notification-state",
+                        str(state_path),
+                        "--deduplicate-notification",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            mocked_query.assert_not_called()
 
     def test_telegram_photo_uses_multipart_without_exposing_secrets(self):
         response = MagicMock()

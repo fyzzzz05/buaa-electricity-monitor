@@ -383,6 +383,50 @@ def update_history(path: Path, readings: list[Reading]) -> list[dict[str, str]]:
     return rows
 
 
+def notification_date(now: datetime | None = None) -> str:
+    """Return the current calendar date used for daily notification deduping."""
+    current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return current.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+
+def notification_already_sent(
+    path: Path, *, now: datetime | None = None
+) -> bool:
+    """Return whether a Telegram report succeeded today in China time."""
+    if not path.exists():
+        return False
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        # Prefer a possible duplicate over silently missing the whole day's report.
+        print(f"通知状态文件不可用，将继续发送：{exc}", file=sys.stderr)
+        return False
+    return state.get("last_successful_date") == notification_date(now)
+
+
+def mark_notification_sent(
+    path: Path, *, now: datetime | None = None
+) -> None:
+    """Persist a successful Telegram report only after the API accepted it."""
+    current = now or datetime.now(timezone.utc)
+    state = {
+        "last_successful_date": notification_date(current),
+        "sent_at": current.astimezone(timezone.utc).isoformat(timespec="seconds"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+    except OSError as exc:
+        raise MonitorError(f"无法保存通知状态 {path}：{exc}") from exc
+
+
 def generate_chart(
     rows: list[dict[str, str]],
     readings: list[Reading],
@@ -671,6 +715,17 @@ def main(argv: list[str] | None = None) -> int:
         help="发送到 Telegram 的折线图路径",
     )
     parser.add_argument(
+        "--notification-state",
+        type=Path,
+        default=Path("data/notification-state.json"),
+        help="每日成功通知状态文件",
+    )
+    parser.add_argument(
+        "--deduplicate-notification",
+        action="store_true",
+        help="今天已经成功发送时跳过本次运行",
+    )
+    parser.add_argument(
         "--no-notify",
         action="store_true",
         help="只查询，不发送 Telegram 消息",
@@ -684,6 +739,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load_config(args.config)
+        if args.deduplicate_notification and notification_already_sent(
+            args.notification_state
+        ):
+            print("今天的 Telegram 日报已经成功发送，跳过本次补跑。")
+            return 0
         if args.test_notification and not args.no_notify:
             telegram_send("✅ 北航宿舍电费监控：Telegram 通知测试成功。")
 
@@ -702,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
                 telegram_send_photo(args.chart, report)
             else:
                 telegram_send(report)
+            mark_notification_sent(args.notification_state)
 
         return 1 if errors else 0
     except MonitorError as exc:

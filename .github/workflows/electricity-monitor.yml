@@ -3,9 +3,10 @@ name: Dorm electricity monitor
 on:
   schedule:
     # The university page currently exposes data updated at 00:00 each day.
-    # Run at 08:17 China time and avoid the busy start of the hour.
-    - cron: "17 8 * * *"
-      timezone: "Asia/Shanghai"
+    # UTC 00:17/00:47/01:17 = China time 08:17/08:47/09:17.
+    # Later attempts exit immediately after the first successful daily report.
+    - cron: "17,47 0 * * *"
+    - cron: "17 1 * * *"
   workflow_dispatch:
     inputs:
       send_test_notification:
@@ -57,28 +58,33 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SEND_TEST_NOTIFICATION: ${{ inputs.send_test_notification }}
+          DEDUPLICATE_NOTIFICATION: ${{ github.event_name == 'schedule' }}
         run: |
           args=(
             --config config.json
             --output monitor-result.json
             --history data/history.csv
             --chart electricity-history.png
+            --notification-state data/notification-state.json
           )
           if [[ "$SEND_TEST_NOTIFICATION" == "true" ]]; then
             args+=(--test-notification)
           fi
+          if [[ "$DEDUPLICATE_NOTIFICATION" == "true" ]]; then
+            args+=(--deduplicate-notification)
+          fi
           python monitor.py "${args[@]}"
 
-      - name: Save daily history
+      - name: Save daily state
         if: always()
         run: |
-          if git diff --quiet -- data/history.csv; then
-            echo "No new history row to commit."
+          if [[ -z "$(git status --porcelain -- data/history.csv data/notification-state.json)" ]]; then
+            echo "No new daily state to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/history.csv
-          git commit -m "chore: update electricity history [skip ci]"
+          git add data/history.csv data/notification-state.json
+          git commit -m "chore: update electricity monitor state [skip ci]"
           git pull --rebase origin "$GITHUB_REF_NAME"
           git push origin "HEAD:$GITHUB_REF_NAME"
