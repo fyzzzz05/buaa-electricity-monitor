@@ -27,7 +27,6 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-
 USER_AGENT = "buaa-dorm-electricity-monitor/1.0"
 NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
@@ -53,9 +52,7 @@ class MeterPageParser(HTMLParser):
         self._row: list[str] | None = None
         self._cell: list[str] | None = None
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
         if tag == "p":
             self._paragraph = []
@@ -158,9 +155,7 @@ def parse_meter_page(
     meter_id = text_after_prefix(parser.paragraphs, "购电表号:")
     address = text_after_prefix(parser.paragraphs, "地址:")
     price_text = text_after_prefix(parser.paragraphs, "电价:")
-    cutoff_line = next(
-        (line for line in parser.paragraphs if "截止" in line), None
-    )
+    cutoff_line = next((line for line in parser.paragraphs if "截止" in line), None)
     remaining_text = parser.widgets.get("canvas1")
 
     if meter_id != str(meter["meter_id"]):
@@ -171,9 +166,7 @@ def parse_meter_page(
         raise MonitorError("页面中没有找到电表地址")
     marker = str(meter["expected_address_contains"])
     if marker not in address:
-        raise MonitorError(
-            f"地址校验失败：期望包含 {marker!r}，页面返回 {address!r}"
-        )
+        raise MonitorError(f"地址校验失败：期望包含 {marker!r}，页面返回 {address!r}")
     if not cutoff_line:
         raise MonitorError("页面中没有找到数据截止时间")
     if remaining_text is None:
@@ -305,9 +298,7 @@ def query_all(config: dict[str, Any]) -> tuple[list[Reading], list[str]]:
         try:
             url = template.format(meter_id=meter["meter_id"])
             page = fetch_text(url, timeout=timeout, retries=retries)
-            readings.append(
-                parse_meter_page(page, meter, max_stale_hours=max_stale)
-            )
+            readings.append(parse_meter_page(page, meter, max_stale_hours=max_stale))
         except (KeyError, ValueError, MonitorError) as exc:
             errors.append(f"{meter.get('name', meter.get('key', '未知电表'))}: {exc}")
     return readings, errors
@@ -560,7 +551,9 @@ def telegram_send(message: str) -> None:
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise MonitorError(f"Telegram 消息发送失败：{exc}") from exc
     if not result.get("ok"):
-        raise MonitorError(f"Telegram API 返回失败：{result.get('description', result)}")
+        raise MonitorError(
+            f"Telegram API 返回失败：{result.get('description', result)}"
+        )
 
 
 def telegram_send_photo(image_path: Path, caption: str) -> None:
@@ -628,7 +621,6 @@ def build_daily_report(readings: list[Reading], errors: list[str]) -> str:
     for error in errors:
         lines.append(f"❌ 查询异常：{error}")
     lines.append("告警线：剩余价值 ≤ ¥10")
-    lines.append("学校数据仅供参考，低电量时请登录购电页面复核。")
     return "\n".join(lines)
 
 
@@ -659,12 +651,6 @@ def build_markdown(readings: list[Reading], errors: list[str]) -> str:
     if errors:
         lines.extend(["", "## 查询异常", ""])
         lines.extend(f"- {error}" for error in errors)
-    lines.extend(
-        [
-            "",
-            "> 学校页面注明：以上数据仅供参考，可能与实际数据存在偏差。",
-        ]
-    )
     return "\n".join(lines) + "\n"
 
 

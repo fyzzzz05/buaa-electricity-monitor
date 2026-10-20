@@ -3,7 +3,7 @@
     "url_template": "https://shsd.buaa.edu.cn/PubBuaa?id={meter_id}",
     "timeout_seconds": 20,
     "retries": 2,
-    "max_stale_hours": 36
+    "max_stale_hours": 60
   },
   "meters": [
     {

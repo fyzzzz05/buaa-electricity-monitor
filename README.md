@@ -17,6 +17,8 @@
 5. Telegram 每天发送完整日报图片，同时标出低于 ¥10 告警线的电表。
 6. GitHub Actions 把更新后的 CSV 和通知状态自动提交回仓库，供下一次绘图及防重复发送使用。
 
+学校页面偶尔可能漏更一天。配置中的 `max_stale_hours` 默认为 60 小时，允许一次日更延迟；如果数据连续两天没有更新，仍会作为查询异常告警。
+
 学校页面请求和 Telegram 通知只使用 Python 标准库；折线图使用
 `matplotlib`，由 GitHub Actions 根据 `requirements.txt` 自动安装。项目不需要保存学校登录 Cookie。
 
